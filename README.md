@@ -1,7 +1,7 @@
 ## Bonsai-Bot
-This is a personal project which aims to climate control my bonsai trees. I will be 
+This is a personal project which aims to aid my bonsai trees. I will be 
 writing the project in rust and documenting it here. The main use case is to 
-create a climate controlled box for my trees to thrive during vacation. 
+create a climate controlled box for my trees to thrive during vacation or winter months.
 
 #### Hardware Components
 - Raspberry Pi 3B
