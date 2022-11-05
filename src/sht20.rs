@@ -1,25 +1,50 @@
 use rppal::i2c::I2c;
+use std::{error, fmt};
 
 const I2C_GPIO_BUS: u8              = 1;
 const SHT20_ADDR: u8                = 0b1000000;  // @note: does not include R/W bit 
-const TEMP_MEAS_HOLD_MASTER: u8     = 0b11100011;
-const TEMP_MEAS_NO_HOLD_MASTER: u8  = 0b11110011;
-const RH_MEAS_HOLD_MASTER: u8       = 0b11100101; 
 const RH_MEAS_NO_HOLD_MASTER: u8    = 0b11110101; 
-const WRITE_USER_REG: u8            = 0b11100110;
-const READ_USER_REG: u8             = 0b11100111;
-const SOFT_RESET: u8                = 0b11111110;
+const TEMP_MEAS_NO_HOLD_MASTER: u8  = 0b11110011;
+
+/// Note: prefixed underscores on unused consts
+const _TEMP_MEAS_HOLD_MASTER: u8     = 0b11100011;
+const _RH_MEAS_HOLD_MASTER: u8       = 0b11100101; 
+const _WRITE_USER_REG: u8            = 0b11100110;
+const _READ_USER_REG: u8             = 0b11100111;
+const _SOFT_RESET: u8                = 0b11111110;
+
 const LSB_STATUS_MASK: u16          = 0x03;
 
-pub type Result<T> = std::result::Result<T, ShtErr>;
+pub type Result<T> = std::result::Result<T, ShtError>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShtErr 
-{
-    Init,
-    Read,
-    Write,
+#[derive(Debug)]
+pub enum ShtError {
     MeasInProgress,
+    BytesReadMismatch,
+    I2c(rppal::i2c::Error),
+}
+
+impl fmt::Display for ShtError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            ShtError::MeasInProgress => 
+                write!(f, "measurement in progress"),
+            ShtError::BytesReadMismatch => 
+                write!(f, "unexpected number of bytes read"),
+            ShtError::I2c(..) => 
+                write!(f, "i2c error"),
+        }
+    }
+}
+
+impl error::Error for ShtError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match *self {
+            ShtError::MeasInProgress => None,
+            ShtError::BytesReadMismatch => None,
+            ShtError::I2c(ref e) => Some(e),
+        }
+    }
 }
 
 pub enum Measurement {
@@ -27,73 +52,83 @@ pub enum Measurement {
     Humidity,
 }
 
-pub struct SHT20
-{
+pub struct SHT20 {
     i2c: I2c,
     measurement_type: Option<Measurement>,
     in_progress: bool,
 }
 
-impl SHT20 
-{
-    pub fn new() -> Result<SHT20> {
+impl SHT20 {
 
+    pub fn new() -> Result<SHT20> {
         match I2c::with_bus(I2C_GPIO_BUS) {
             Ok(mut i2c_device) => 
-                if i2c_device.set_slave_address(SHT20_ADDR as u16).is_err() {
-                    return Err(ShtErr::Init);
+                if let Err(e) = i2c_device.set_slave_address(SHT20_ADDR as u16) {
+                    return Err(ShtError::I2c(e));
                 } else {
                     return Ok(
-                        SHT20{
+                        SHT20 {
                             i2c: i2c_device,
                             measurement_type: None,
                             in_progress: false,
                         })
                 },
-            Err(_) => Err(ShtErr::Init),
+            Err(e) => {
+                return Err(ShtError::I2c(e));
+            }, 
         }
     }
 
-    pub fn trigger_temp_measurement(&mut self) -> Result<()> {
+    pub fn get_temperature_celsius(&mut self) -> Result<f32> {
+        self.trigger_temp_measurement()?;
+        std::thread::sleep(std::time::Duration::from_millis(85));
+        return self.read_measurement();
+    }
+
+    pub fn get_humidity_percent(&mut self) -> Result<f32> {
+        self.trigger_humidity_measurement()?;
+        std::thread::sleep(std::time::Duration::from_millis(85));
+        return self.read_measurement();
+    }
+
+    fn trigger_temp_measurement(&mut self) -> Result<()> {
        
         if self.in_progress { 
-            return Err(ShtErr::MeasInProgress)
+            return Err(ShtError::MeasInProgress);
         }
 
         match self.i2c.write(&[TEMP_MEAS_NO_HOLD_MASTER]) {
-           Ok(1) => {
+           Ok(_) => {
                self.in_progress = true; 
                Ok(())
            }
-           Ok(_) => Err(ShtErr::Write),
-           Err(_) => Err(ShtErr::Write),
+           Err(e) => Err(ShtError::I2c(e))
         }
     }
 
-    pub fn trigger_humidity_measurement(&mut self) -> Result<()> {
+    fn trigger_humidity_measurement(&mut self) -> Result<()> {
 
         if self.in_progress { 
-            return Err(ShtErr::MeasInProgress)
+            return Err(ShtError::MeasInProgress);
         }
 
         match self.i2c.write(&[RH_MEAS_NO_HOLD_MASTER]) {
-           Ok(1) => {
+           Ok(_) => {
                self.in_progress = true; 
                Ok(())
            },
-           Ok(_) => Err(ShtErr::Write),
-           Err(_) => Err(ShtErr::Write),
+           Err(e) => Err(ShtError::I2c(e))
         }
     }
 
-    pub fn read_measurement(&mut self) -> Result<f32> {
+    fn read_measurement(&mut self) -> Result<f32> {
 
         const EXPECTED_BYTES: usize = 2;
         let mut raw_bytes: [u8; EXPECTED_BYTES] = [0, 0];
 
         if let Ok(EXPECTED_BYTES) = self.i2c.read(&mut raw_bytes[..]) {
 
-            let data: u16 = (raw_bytes[0] as u16) << 16 | raw_bytes[1] as u16;
+            let data: u16 = (raw_bytes[0] as u16) << 8 | raw_bytes[1] as u16;
             if data & LSB_STATUS_MASK == 0 {
                 // it is a temperature measurement - use 14-bit representation
                 self.measurement_type = Some(Measurement::Temperature);
@@ -108,7 +143,7 @@ impl SHT20
 
         } else { 
             self.in_progress = false;
-            return Err(ShtErr::Read);
+            return Err(ShtError::BytesReadMismatch);
         } 
     }
 
