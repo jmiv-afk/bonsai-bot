@@ -13,7 +13,7 @@ const _WRITE_USER_REG: u8            = 0b11100110;
 const _READ_USER_REG: u8             = 0b11100111;
 const _SOFT_RESET: u8                = 0b11111110;
 
-const LSB_STATUS_MASK: u16          = 0x03;
+const LSB_STATUS_MASK: u16           = 0x03;
 
 pub type Result<T> = std::result::Result<T, ShtError>;
 
