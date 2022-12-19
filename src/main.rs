@@ -11,14 +11,16 @@ use std::time::{
     Duration as stdDuration, 
     Instant,
 };
+use std::thread::sleep;
 
 //
 // see pinout at link below:
 // https://www.etechnophiles.com/wp-content/uploads/2020/12/R-PI-pinout.jpg?ezimgfmt=ng:webp/ngcb40
 // 
-const HUMIDIFIER_PIN:     u8 = 22; 
+const HUMIDIFIER_PIN:     u8 = 24; 
 const LIGHT_PIN:          u8 = 23;
-const FAN_PIN:            u8 = 27; 
+const PUMP_PIN:           u8 = 27;
+const FAN_PIN:            u8 = 22; 
 
 fn main() -> Result<(), Box<dyn Error>> {
 
@@ -27,6 +29,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // initialize gpios and peripherals
     let mut temp_humidity = SHT20::new()?;
     let mut humd_gpio     = gpio.get(HUMIDIFIER_PIN)?.into_output(); 
+    let mut pump_gpio     = gpio.get(PUMP_PIN)?.into_output(); 
     let mut fan_gpio      = gpio.get(FAN_PIN)?.into_output();
     let mut light_gpio    = gpio.get(LIGHT_PIN)?.into_output();
 
@@ -34,16 +37,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut prev_state_change_humidity: Instant = Instant::now();
     let mut prev_state_change_fan:      Instant = Instant::now();
 
-    let _ = Timer::new().schedule_repeating(Duration::seconds(5), move || {
+    /*let _guard_1 = Timer::new().schedule_repeating(Duration::seconds(5), move || {
         humidity_service(&mut prev_state_change_humidity, &mut temp_humidity, &mut humd_gpio);
     });
+    */
 
-    let _ = Timer::new().schedule_repeating(Duration::seconds(1), move || {
+    let pump_timer = Timer::new();
+    let fan_timer = Timer::new();
+
+    let _fan_guard = fan_timer.schedule_repeating(Duration::seconds(60), move || {
         fan_service(&mut prev_state_change_fan, &mut fan_gpio);
     });
 
-    let _ = Timer::new().schedule_repeating(Duration::minutes(1), move || {
-        light_service(&mut light_gpio);
+    let _pump_guard = pump_timer.schedule_repeating(Duration::seconds(10), move || {
+        pump_service(&mut pump_gpio);
     });
 
     loop {
@@ -79,22 +86,19 @@ fn light_service(light: &mut OutputPin) {
 
 }
 
+fn pump_service(pump: &mut OutputPin) {
+    println!("Turning pump on");
+    pump.set_high();
+    sleep(stdDuration::from_secs(1));
+    println!("Turning pump off");
+    pump.set_low();
+}
+
 fn fan_service(prev_time: &mut Instant, fan: &mut OutputPin) {
 
-    let fan_time_on_secs = 60;
-    let fan_time_off_secs = 10*60; 
-
-    if fan.is_set_high() && prev_time.elapsed() > stdDuration::from_secs(fan_time_on_secs) {
-        // fan is on and time elapsed exceeds time to be on, turn off fan
-        println!("Turning lights off");
-        fan.set_low();
-        *prev_time = Instant::now();
-    }
-
-    if fan.is_set_low() && prev_time.elapsed() > stdDuration::from_secs(fan_time_off_secs) {
-        // fan is off and time elapsed exceeds time to be off, turn on fan
-        println!("Turning lights on");
-        fan.set_high();
-        *prev_time = Instant::now();
-    }
+    println!("Turning fan on");
+    fan.set_high();
+    sleep(stdDuration::from_secs(1));
+    println!("Turning fan off");
+    fan.set_low();
 }
