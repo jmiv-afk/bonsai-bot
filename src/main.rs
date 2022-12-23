@@ -73,8 +73,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Err(e) => panic!("no pump scheduled: {}", e),
     };
 
-    // setup Instants tracking state changes
-    let mut prev_state_change_climate: Instant = Instant::now();
+    // setup Instant tracking most recent log time, subtract datalog interval so first log
+    // happens immediately on first service execution
+    let mut prev_log_time_climate: Instant = Instant::now() - OldDuration::from_secs(DATALOG_INTERVAL_MINS * 60 + 1);
 
     // setup timers
     let pump_timer = Timer::new();
@@ -82,7 +83,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let climate_timer = Timer::new();
 
     let _climate_guard = climate_timer.schedule_repeating(Duration::minutes(CLIMATE_PERIODIC_MINS), move || {
-        climate_service(&mut prev_state_change_climate, &mut temp_humidity, &mut humd_gpio);
+        climate_service(&mut prev_log_time_climate, &mut temp_humidity, &mut humd_gpio);
     });
 
     let _fan_guard = fan_timer.schedule_repeating(Duration::minutes(FAN_PERIODIC_MINS), move || {
@@ -145,10 +146,7 @@ fn climate_service(prev_time: &mut Instant, temp_humidity: &mut SHT20, humd: &mu
 /// @brief runs the pump for a brief period of time and writes timestamp to log file 
 ///
 fn pump_service(pump: &mut OutputPin) {
-    pump.set_high();
-    sleep(OldDuration::from_secs(PUMP_DURATION_SECS));
-    pump.set_low();
-    // TODO: append timestamp to file 
+    // append timestamp to file 
     let mut f = fs::OpenOptions::new()
         .write(true)
         .append(true) 
@@ -157,6 +155,9 @@ fn pump_service(pump: &mut OutputPin) {
     if let Err(e) = writeln!(f, "{}", Local::now()) {
         println!("cannot write to pump log: {}", e.to_string());
     }
+    pump.set_high();
+    sleep(OldDuration::from_secs(PUMP_DURATION_SECS));
+    pump.set_low();
 }
 
 ///
