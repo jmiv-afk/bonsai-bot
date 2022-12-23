@@ -10,8 +10,7 @@ use chrono::{
     DateTime,
     Local,
     TimeZone,
-    NaiveDate,
-    NaiveDateTime,
+    FixedOffset,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -53,7 +52,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 
     let pump_log_file = PathBuf::from("/home/jake/bonsai-bot/pump_log.txt");
-    let pump_schedule_dt: DateTime<Local> = get_next_pump_schedule(pump_log_file)?;
+    let pump_schedule_dt: DateTime<FixedOffset> = get_next_pump_schedule(pump_log_file)?;
 
     // setup Instants tracking state changes
     let mut prev_state_change_climate: Instant = Instant::now();
@@ -140,25 +139,26 @@ fn fan_service(fan: &mut OutputPin) {
     fan.set_low();
 }
 
-fn get_next_pump_schedule(path: PathBuf) -> Result<DateTime<Local>, Box<dyn Error>> {
+fn get_next_pump_schedule(path: PathBuf) -> Result<DateTime<FixedOffset>, Box<dyn Error>> {
     if path.is_file() && path.exists() {
         let f = fs::OpenOptions::new()
             .read(true)
             .open(&path)?;
-        let timestr = BufReader::new(f).lines().last().ok_or("");
-        let dt: NaiveDateTime = timestr??.parse()?;
-        println!("here");
-        if let Some(t) = Local.from_local_datetime(&dt).earliest() {
-            // we have found the local time of the last line of the file so the next
-            // watering time is 24 hours later 
-            println!("Scheduling next pump sequence at: {}", t+Duration::hours(24));
-            return Ok(t + Duration::hours(24));
+        let timestr_vec: Vec<String> = BufReader::new(f).lines().collect::<Result<Vec<String>, _>>()?;
+        if let Some(timestr) = timestr_vec.last() {
+            if let Ok(t) = DateTime::parse_from_str(&timestr, "%Y-%m-%d %H:%M:%S%.f %z") {
+                //if let Some(t) = Local.from_local_datetime(&dt).earliest() {
+                    // we have found the local time of the last line of the file so the next
+                    // watering time is 24 hours later 
+                    println!("Scheduling next pump sequence at: {}", t+Duration::hours(24));
+                    return Ok(t + Duration::hours(24));
+                //}
+            }
         }
     }
 
     // return default
-    return Ok(Local.from_local_datetime(&NaiveDate::from_ymd_opt(2022, 12, 21).expect("ymd")
-        .and_hms_opt(23, 13, 0).expect("hms")).unwrap());
+    return Ok(FixedOffset::west_opt(7*3600).unwrap().with_ymd_and_hms(2022, 12, 21, 23, 13, 0).unwrap());
 }
 
 fn create_climate_log(path: PathBuf) -> Result<(), Box<dyn Error>> {
