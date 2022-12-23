@@ -147,6 +147,7 @@ impl SHT20 {
         } 
     }
 
+    #[allow(dead_code)]
     pub fn get_measurement_type(self) -> Option<Measurement> {
         return self.measurement_type;
     }
