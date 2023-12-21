@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 chrono = "0.4.23"
-timer = "0.2.0"
-rppal = "0.13.1"
-
+timer = "0.2.*"
+rppal = "0.13.*"
+postgres = {version = "0.19.*", features = ["with-chrono-0_4"] }
+systemd = "0.10"

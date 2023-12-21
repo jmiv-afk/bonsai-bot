@@ -164,3 +164,15 @@ impl SHT20 {
         return -46.85 + 175.72 * raw_temp as f32 / 65536.0;
     }
 } 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    pub fn test_sht20() {
+        let mut s = SHT20::new().expect("Failed to create SHT20");
+        s.get_temperature_celsius().expect("Failed to get temperature");
+    }
+}
+
