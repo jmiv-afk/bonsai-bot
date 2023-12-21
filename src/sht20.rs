@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use rppal::i2c::I2c;
 use std::{error, fmt};
 
@@ -28,11 +30,11 @@ impl fmt::Display for ShtError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             ShtError::MeasInProgress => 
-                write!(f, "measurement in progress"),
+                write!(f, "Measurement in progress"),
             ShtError::BytesReadMismatch => 
-                write!(f, "unexpected number of bytes read"),
+                write!(f, "Unexpected number of bytes read"),
             ShtError::I2c(..) => 
-                write!(f, "i2c error"),
+                write!(f, "I2C error"),
         }
     }
 }
@@ -79,16 +81,18 @@ impl SHT20 {
         }
     }
 
-    pub fn get_temperature_celsius(&mut self) -> Result<f32> {
-        self.trigger_temp_measurement()?;
+    pub async fn get_temperature_celsius(sht20: Arc<Mutex<Self>>) -> Result<f32> {
+        let mut sht20 = sht20.lock().await;
+        sht20.trigger_temp_measurement()?;
         std::thread::sleep(std::time::Duration::from_millis(85));
-        return self.read_measurement();
+        return sht20.read_measurement();
     }
 
-    pub fn get_humidity_percent(&mut self) -> Result<f32> {
-        self.trigger_humidity_measurement()?;
+    pub async fn get_humidity_percent(sht20: Arc<Mutex<Self>>) -> Result<f32> {
+        let mut sht20 = sht20.lock().await;
+        sht20.trigger_humidity_measurement()?;
         std::thread::sleep(std::time::Duration::from_millis(85));
-        return self.read_measurement();
+        return sht20.read_measurement();
     }
 
     fn trigger_temp_measurement(&mut self) -> Result<()> {
@@ -172,7 +176,7 @@ mod tests {
     #[test]
     pub fn test_sht20() {
         let mut s = SHT20::new().expect("Failed to create SHT20");
-        s.get_temperature_celsius().expect("Failed to get temperature");
+        s.get_temperature_celsius().await.expect("Failed to get temperature");
     }
 }
 

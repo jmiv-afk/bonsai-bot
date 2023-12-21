@@ -5,3 +5,4 @@ tags
 check_running.sh
 climate_log.csv
 pump_log.txt
+Cargo.lock

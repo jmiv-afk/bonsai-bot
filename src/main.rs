@@ -1,36 +1,13 @@
 mod sht20;
 use sht20::SHT20;
-use rppal::gpio::{
-    Gpio,
-    OutputPin,
-};
-use timer::Timer;
-use chrono::{
-    Duration,
-    DateTime,
-    Local,
-    Utc,
-    TimeZone,
-    FixedOffset,
-};
-use std::fs;
-use std::path::PathBuf;
-use std::io::{
-    BufReader,
-    BufRead,
-    Write,
-}; 
+use rppal::gpio::{Gpio, OutputPin};
+use chrono::{DateTime, Duration, Utc};
 use std::error::Error;
-use std::thread::sleep;
-use std::env;
-use std::time::{
-    //Instant,
-    Duration as OldDuration,
-};
-use postgres::{
-    Client, 
-    NoTls,
-};
+use std::time::{Duration as StdDuration};
+use std::sync::Arc;
+use tokio::time::{interval_at, sleep, Instant, Duration as TokioDuration};
+use tokio::sync::Mutex;
+use tokio_postgres::{Client, NoTls};
 use systemd::journal;
 
 //
@@ -41,107 +18,132 @@ use systemd::journal;
 // 
 // @note the control board still has one additional relay for future expansion (recommend gpio 23)
 //
-//static CLIMATE_LOG_FILE:      &'static str = "/home/jake/bonsai-bot/climate_log.csv";
-static PUMP_LOG_FILE:         &'static str = "/home/jake/bonsai-bot/pump_log.txt";
-const  HUMIDIFIER_PIN:        u8           = 24; 
-const  PUMP_PIN:              u8           = 27;
 const  FAN_PIN:               u8           = 22; 
-const  FAN_PERIODIC_MINS:     i64          = 5;
-const  CLIMATE_PERIODIC_MINS: i64          = 1;
-const  PUMP_PERIODIC_HRS:     i64          = 24;
-//const  DATALOG_INTERVAL_MINS: u64          = 1;
+const  FAN_PERIODIC_MINS:     i64          = 3;
 const  FAN_DURATION_SECS:     u64          = 30;
-const  PUMP_DURATION_SECS:    u64          = 60;
+const  HUMIDIFIER_PIN:        u8           = 24; 
+const  CLIMATE_PERIODIC_MINS: i64          = 5;
+const  PUMP_PIN:              u8           = 27;
+const  PUMP_PERIODIC_HRS:     i64          = 24;
+const  PUMP_DURATION_SECS:    u64          = 30;
 
 ///
-/// @brief The main routine
+/// @brief The main routine, for mains
 ///
-fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
+    // get that journal up 
     journal::JournalLog::init().unwrap();
 
     // create our GPIO'y-bois
     let gpio = Gpio::new()?;
 
     // initialize gpios and peripherals
-    let mut temp_humidity = SHT20::new()?;
+    let sht20             = Arc::new(Mutex::new(SHT20::new()?));
     let mut humd_gpio     = gpio.get(HUMIDIFIER_PIN)?.into_output(); 
     let mut pump_gpio     = gpio.get(PUMP_PIN)?.into_output(); 
     let mut fan_gpio      = gpio.get(FAN_PIN)?.into_output();
 
-    // create or append to climate temp/humidity database
-    let database_url = env::var("BONSAIBOT_DATABASE_URL")?;
-    let mut postgres_client = Client::connect(&database_url, NoTls)?;
-
-    //let climate_log_file = PathBuf::from(CLIMATE_LOG_FILE);
-    //match create_climate_log(climate_log_file) {
-    //    Ok(_) => (),
-    //    Err(e) => panic!("climate_log.csv cannot be created: {}", e),
-    //};
+    // connect to database
+    let database_url = std::env::var("BONSAIBOT_DATABASE_URL")?;
+    let (mut postgres_client, connection) = tokio_postgres::connect(&database_url, NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            journal::print(3, &format!("Connection error: {}", e));
+            panic!("Panic! Could not connect to DB");
+        }
+    });
 
     // get updated timing for the next pump sequence
-    let pump_log_file = PathBuf::from(PUMP_LOG_FILE);
-    let pump_schedule_dt: DateTime<FixedOffset> = match get_next_pump_schedule(pump_log_file) {
+    let pump_schedule_dt = match get_next_pump_schedule(&mut postgres_client).await {
         Ok(t) => t,
-        Err(e) => panic!("no pump scheduled: {}", e),
+        Err(e) => panic!("No pump scheduled: {}", e),
     };
 
-    // setup Instant tracking most recent log time, subtract datalog interval so first log
-    // happens immediately on first service execution
-    //let mut prev_log_time_climate: Instant = Instant::now() - OldDuration::from_secs(DATALOG_INTERVAL_MINS * 60 + 1);
+    // Assuming pump_schedule_dt is of type DateTime<Utc>
+    // Convert it to a std::time::Instant
+    let now = Instant::now();
+    let pump_schedule_instant = Instant::now() + StdDuration::from_secs(pump_schedule_dt.timestamp() as u64 - Utc::now().timestamp() as u64);
 
-    // setup timers
-    let pump_timer = Timer::new();
-    let fan_timer = Timer::new();
-    let climate_timer = Timer::new();
+    // Calculate the duration until the pump schedule. If the time is in the past, default to a zero duration.
+    let duration_until_pump = if pump_schedule_instant > now {
+        pump_schedule_instant.duration_since(now)
+    } else {
+        StdDuration::from_secs(0)
+    };
 
-    let _climate_guard = climate_timer.schedule_repeating(Duration::minutes(CLIMATE_PERIODIC_MINS), move || {
-        climate_service(&mut postgres_client, &mut temp_humidity, &mut humd_gpio);
-    });
-
-    let _fan_guard = fan_timer.schedule_repeating(Duration::minutes(FAN_PERIODIC_MINS), move || {
-        fan_service(&mut fan_gpio);
-    });
-
-    let _pump_guard = pump_timer.schedule(pump_schedule_dt, Some(Duration::hours(PUMP_PERIODIC_HRS)), move || { 
-        pump_service(&mut pump_gpio); 
-    });
+    // setup service tick intervals
+    let mut climate_interval = interval_at(now, TokioDuration::from_secs(60 * CLIMATE_PERIODIC_MINS as u64));
+    let mut fan_interval = interval_at(now, TokioDuration::from_secs(60 * FAN_PERIODIC_MINS as u64));
+    let mut pump_interval = interval_at(now + duration_until_pump,
+                        TokioDuration::from_secs(60 * 60 * PUMP_PERIODIC_HRS as u64));
 
     loop {
-        // do nothing!
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        tokio::select! {
+            _ = climate_interval.tick() => {
+                match climate_service(&mut postgres_client, sht20.clone(), &mut humd_gpio).await {
+                    Ok(_) => {},
+                    Err(e) => {
+                        journal::print(3, &format!("Climate service error: {}", e));
+                        ()
+                    },
+                }
+            }
+            _ = fan_interval.tick() => {
+                match fan_service(&mut fan_gpio).await {
+                    Ok(_) => {},
+                    Err(e) => {
+                        journal::print(3, &format!("Fan service error: {}", e));
+                        ()
+                    }
+                }
+            },
+            _ = pump_interval.tick() => {
+                match pump_service(&mut postgres_client, &mut pump_gpio).await {
+                    Ok(_) => {},
+                    Err(e) => {
+                        journal::print(3, &format!("Pump service error: {}", e));
+                        ()
+                    }
+                }
+            }
+        }
     }
 }
 
 ///
-/// @brief turns on humidifier if RH < RH_LO_THRESH and off if RH > RH_HI_THRESH 
-///        and logs data at DATALOG_INTERVAL_MINS 
+/// @brief turns on humidifier if RH < RH_LO_THRESH and off if RH > RH_HI_THRESH
+///        and logs temperature and humidity to the database
 ///    
-fn climate_service(client: &mut Client, temp_humidity: &mut SHT20, humd: &mut OutputPin) -> Result<(), Box<dyn Error>> {
+async fn climate_service(
+    client: &mut Client, 
+    sht20: Arc<Mutex<SHT20>>, 
+    humd: &mut OutputPin
+) -> Result<(), Box<dyn Error>> {
 
-    const RH_LO_THRESH: f32 = 70.0;  // percent
-    const RH_HI_THRESH: f32 = 80.0;  // percent
+    const RH_LO_THRESH: f64 = 70.0;  // percent
+    const RH_HI_THRESH: f64 = 80.0;  // percent
 
-    let temp = match temp_humidity.get_temperature_celsius() {
-        Ok(t) => t,
+
+    let temp = match SHT20::get_temperature_celsius(sht20.clone()).await {
+        Ok(t) => t as f64,
         Err(e) => {
             journal::print(3, &format!("No temp measurement avail"));
-            //warn!("No temp avail");
             return Err(Box::new(e));
         },
     };
 
-    let rh = match temp_humidity.get_humidity_percent() {
-        Ok(t) => t,
+    let rh = match SHT20::get_humidity_percent(sht20).await {
+        Ok(t) => t as f64,
         Err(e) => {
             journal::print(3, &format!("No humidity measurement avail"));
-            //warn!("No humd avail");
             return Err(Box::new(e));
         },
     };
 
     // Insert data into the database
-    let stmt = match client.prepare("INSERT INTO climate_data (timestamp, temperature, humidity) VALUES ($1, $2, $3)") {
+    let stmt = match client.prepare("INSERT INTO climate_data (timestamp, temperature, humidity, is_pump_start) VALUES ($1, $2, $3, FALSE)").await {
         Ok(t) => t,
         Err(e) => {
             journal::print(3, &format!("Database prepare error {:?}", e));
@@ -149,9 +151,11 @@ fn climate_service(client: &mut Client, temp_humidity: &mut SHT20, humd: &mut Ou
         }
     };
 
-    let localtime = Local::now();
-    let utctime: DateTime<Utc> = localtime.with_timezone(&Utc);
-    let _ = match client.execute(&stmt, &[&utctime, &(temp.clone() as f64), &(rh.clone() as f64)]) {
+//    let localtime = Local::now();
+//    let utctime: DateTime<Utc> = localtime.with_timezone(&Utc);
+    let utctime = Utc::now();
+
+    let _ = match client.execute(&stmt, &[&utctime, &(temp.clone()), &(rh.clone())]).await {
         Ok(t) => t,
         Err(e) => {
             journal::print(3, &format!("Database execute error {:?}", e));
@@ -159,21 +163,7 @@ fn climate_service(client: &mut Client, temp_humidity: &mut SHT20, humd: &mut Ou
         }
     };
 
-    //info!("Inserted into database");
     journal::print(6, &format!("Inserted {:3.2}, {:3.2} into database", temp, rh));
-
-    //if prev_time.elapsed() > OldDuration::from_secs(DATALOG_INTERVAL_MINS * 60) {
-    //    *prev_time = Instant::now();
-    //    let mut f = fs::OpenOptions::new()
-    //        .write(true)
-    //        .append(true) 
-    //        .open(CLIMATE_LOG_FILE)
-    //        .expect("climate_log.csv cannot be opened");
-    //    // log temp/humidity
-    //    if let Err(e) = writeln!(f, "{}, {:.2}, {:.2}", Local::now(), temp, rh) {
-    //        journal::print("cannot write to climate_log: {}", e.to_string());
-    //    }
-    //}
 
     // humidifier is on and humidity is less than threshold
     if rh < RH_LO_THRESH {
@@ -191,75 +181,44 @@ fn climate_service(client: &mut Client, temp_humidity: &mut SHT20, humd: &mut Ou
 ///
 /// @brief runs the pump for a brief period of time and writes timestamp to log file 
 ///
-fn pump_service(pump: &mut OutputPin) {
-    // append timestamp to file 
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .append(true) 
-        .open("/home/jake/bonsai-bot/pump_log.txt")
-        .expect("pump_log.txt cannot be opened");
-    if let Err(e) = writeln!(f, "{}", Local::now()) {
-        journal::print(3, &format!("Cannot write to pump log: {}", e.to_string()));
-        //warn!("cannot write to pump log: {}", e.to_string());
-    }
-    pump.set_high();
-    sleep(OldDuration::from_secs(PUMP_DURATION_SECS));
-    pump.set_low();
-}
+async fn pump_service(client: &mut Client, pump: &mut OutputPin) -> Result<(), Box<dyn std::error::Error>> {
 
-///
-/// @brief runs the fans for a brief period of time
-///
-fn fan_service(fan: &mut OutputPin) {
-    fan.set_high();
-    sleep(OldDuration::from_secs(FAN_DURATION_SECS));
-    fan.set_low();
+    let start_time = Utc::now();
+    let stmt = "INSERT INTO climate_data (timestamp, temperature, humidity, is_pump_start) VALUES ($1, NULL, NULL, TRUE);";
+
+    client.execute(stmt, &[&start_time]).await?;
+
+    pump.set_high();
+    sleep(TokioDuration::from_secs(PUMP_DURATION_SECS)).await;
+    pump.set_low();
+
+    Ok(())
 }
 
 ///
 /// @brief gets the next pump service time based on pump log file timestamps 
 ///
-fn get_next_pump_schedule(path: PathBuf) -> Result<DateTime<FixedOffset>, Box<dyn Error>> {
-    if path.is_file() && path.exists() {
-        let f = fs::OpenOptions::new()
-            .read(true)
-            .open(&path)?;
-        let timestr_vec: Vec<String> = BufReader::new(f).lines().collect::<Result<Vec<String>, _>>()?;
-        if let Some(timestr) = timestr_vec.last() {
-            if let Ok(t) = DateTime::parse_from_str(&timestr, "%Y-%m-%d %H:%M:%S%.f %z") {
-                // we have found the local time of the last line of the file so the next
-                // watering time is 24 hours later 
-                let next_sequence = t+Duration::hours(PUMP_PERIODIC_HRS);
-                journal::print(6, &format!("Scheduling next pump sequence at: {}", next_sequence));
-                //info!("scheduling next pump sequence at: {}", next_sequence);
-                return Ok(next_sequence);
-            }
-        }
-    }
+async fn get_next_pump_schedule(client: &mut Client) -> Result<DateTime<Utc>, Box<dyn std::error::Error>> {
+    let stmt = "SELECT MAX(timestamp) FROM climate_data WHERE is_pump_start = TRUE;";
+    let rows = client.query(stmt, &[]).await?;
 
-    // return default Dec 1, 2022 12:00 MT(-7:00)
-    return Ok(FixedOffset::west_opt(7*3600).unwrap().with_ymd_and_hms(2022, 12, 01, 12, 0, 0).unwrap());
+    if let Some(row) = rows.get(0) {
+        let last_pump_time: DateTime<Utc> = row.get(0);
+        Ok(last_pump_time + Duration::hours(PUMP_PERIODIC_HRS))
+    } else {
+        // If no entry found, default to current time + pump interval
+        Ok(Utc::now() + Duration::hours(PUMP_PERIODIC_HRS))
+    }
 }
 
-//
-// @brief creates the climate log file with header if it doesn't exist or is empty
-//
-//fn create_climate_log(path: PathBuf) -> Result<(), Box<dyn Error>> {
-//    let mut line = String::new();
-//    if path.is_file() {
-//        // read file, ensure header is written
-//        let f = fs::OpenOptions::new()
-//            .read(true)
-//            .open(&path)?;
-//        let mut rdr = BufReader::new(f);
-//        rdr.read_line(&mut line)?;
-//    } 
-//    if line.is_empty() {
-//        let mut f = fs::OpenOptions::new()
-//            .write(true)
-//            .create(true)
-//            .open(&path)?;
-//        writeln!(f, "Timestamp(Local),Temperature(degC),Humidity(%)")?;
-//    }
-//    Ok(())
-//}
+///
+/// @brief runs the fans for a brief period of time
+///
+async fn fan_service(fan: &mut OutputPin) -> Result<(), Box<dyn std::error::Error>> {
+    fan.set_high();
+    sleep(TokioDuration::from_secs(FAN_DURATION_SECS)).await;
+    fan.set_low();
+
+    Ok(())
+}
+
