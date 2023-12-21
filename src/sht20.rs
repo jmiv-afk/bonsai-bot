@@ -1,8 +1,6 @@
-use tokio::task;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use rppal::i2c::I2c;
-use std::time::Duration;
 use std::{error, fmt};
 
 const I2C_GPIO_BUS: u8              = 1;

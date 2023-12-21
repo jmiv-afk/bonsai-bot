@@ -1,15 +1,14 @@
 mod sht20;
 use sht20::SHT20;
 use rppal::gpio::{Gpio, OutputPin};
-use chrono::{DateTime, Duration, FixedOffset, Local, TimeZone, Utc};
-use std::path::PathBuf;
-use std::fs::File;
-use std::io::{BufReader, BufRead, Write};
-use tokio::prelude::*;
-use tokio::time::{sleep, Duration as TokioDuration};
+use chrono::{DateTime, Duration, Utc};
+use std::error::Error;
+use std::time::{Duration as StdDuration};
+use std::sync::Arc;
+use tokio::time::{interval_at, sleep, Instant, Duration as TokioDuration};
+use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls};
-use tokio_systemd::journal;
-use futures::stream::StreamExt;
+use systemd::journal;
 
 //
 // @brief  configuration parameters
@@ -41,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gpio = Gpio::new()?;
 
     // initialize gpios and peripherals
-    let mut sht20         = SHT20::new()?;
+    let sht20             = Arc::new(Mutex::new(SHT20::new()?));
     let mut humd_gpio     = gpio.get(HUMIDIFIER_PIN)?.into_output(); 
     let mut pump_gpio     = gpio.get(PUMP_PIN)?.into_output(); 
     let mut fan_gpio      = gpio.get(FAN_PIN)?.into_output();
@@ -54,38 +53,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             journal::print(3, &format!("Connection error: {}", e));
             panic!("Panic! Could not connect to DB");
         }
-    })
+    });
 
     // get updated timing for the next pump sequence
-    let pump_schedule_dt = match get_next_pump_schedule(&mut postgres_client) {
+    let pump_schedule_dt = match get_next_pump_schedule(&mut postgres_client).await {
         Ok(t) => t,
         Err(e) => panic!("No pump scheduled: {}", e),
     };
 
+    // Assuming pump_schedule_dt is of type DateTime<Utc>
+    // Convert it to a std::time::Instant
+    let now = Instant::now();
+    let pump_schedule_instant = Instant::now() + StdDuration::from_secs(pump_schedule_dt.timestamp() as u64 - Utc::now().timestamp() as u64);
+
+    // Calculate the duration until the pump schedule. If the time is in the past, default to a zero duration.
+    let duration_until_pump = if pump_schedule_instant > now {
+        pump_schedule_instant.duration_since(now)
+    } else {
+        StdDuration::from_secs(0)
+    };
+
     // setup service tick intervals
-    let climate_interval = interval_at(Instant::now(), TokioDuration::from_secs(60 * CLIMATE_PERIODIC_MINS as u64));
-    let fan_interval = interval_at(Instant::now(), TokioDuration::from_secs(60 * FAN_PERIODIC_MINS as u64));
-    let pump_interval = interval_at(Instant::now() + TokioDuration::from_secs_until(pump_schedule_dt), 
+    let mut climate_interval = interval_at(now, TokioDuration::from_secs(60 * CLIMATE_PERIODIC_MINS as u64));
+    let mut fan_interval = interval_at(now, TokioDuration::from_secs(60 * FAN_PERIODIC_MINS as u64));
+    let mut pump_interval = interval_at(now + duration_until_pump,
                         TokioDuration::from_secs(60 * 60 * PUMP_PERIODIC_HRS as u64));
 
     loop {
         tokio::select! {
             _ = climate_interval.tick() => {
-                match climate_service(&mut postgres_client, &mut sht20, &mut humd_gpio).await {
-                    Ok() => (),
-                    Err(e) => journal::print(3, &format!("Climate service error: {}", e)),
+                match climate_service(&mut postgres_client, sht20.clone(), &mut humd_gpio).await {
+                    Ok(_) => {},
+                    Err(e) => {
+                        journal::print(3, &format!("Climate service error: {}", e));
+                        ()
+                    },
                 }
             }
             _ = fan_interval.tick() => {
                 match fan_service(&mut fan_gpio).await {
                     Ok(_) => {},
-                    Err(e) => journal::print(3, &format!("Fan service error: {}", e)),
+                    Err(e) => {
+                        journal::print(3, &format!("Fan service error: {}", e));
+                        ()
+                    }
                 }
             },
             _ = pump_interval.tick() => {
                 match pump_service(&mut postgres_client, &mut pump_gpio).await {
                     Ok(_) => {},
-                    Err(e) => journal::print(3, &format!("Pump service error: {}", e)),
+                    Err(e) => {
+                        journal::print(3, &format!("Pump service error: {}", e));
+                        ()
+                    }
                 }
             }
         }
@@ -98,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///    
 async fn climate_service(
     client: &mut Client, 
-    sht20: &mut SHT20, 
+    sht20: Arc<Mutex<SHT20>>, 
     humd: &mut OutputPin
 ) -> Result<(), Box<dyn Error>> {
 
@@ -106,7 +126,7 @@ async fn climate_service(
     const RH_HI_THRESH: f64 = 80.0;  // percent
 
 
-    let temp = match sht20.get_temperature_celsius().await {
+    let temp = match SHT20::get_temperature_celsius(sht20.clone()).await {
         Ok(t) => t as f64,
         Err(e) => {
             journal::print(3, &format!("No temp measurement avail"));
@@ -114,7 +134,7 @@ async fn climate_service(
         },
     };
 
-    let rh = match sht20.get_humidity_percent().await {
+    let rh = match SHT20::get_humidity_percent(sht20).await {
         Ok(t) => t as f64,
         Err(e) => {
             journal::print(3, &format!("No humidity measurement avail"));
@@ -123,7 +143,7 @@ async fn climate_service(
     };
 
     // Insert data into the database
-    let stmt = match client.prepare("INSERT INTO climate_data (timestamp, temperature, humidity, is_pump_start) VALUES ($1, $2, $3, FALSE)") {
+    let stmt = match client.prepare("INSERT INTO climate_data (timestamp, temperature, humidity, is_pump_start) VALUES ($1, $2, $3, FALSE)").await {
         Ok(t) => t,
         Err(e) => {
             journal::print(3, &format!("Database prepare error {:?}", e));
@@ -135,7 +155,7 @@ async fn climate_service(
 //    let utctime: DateTime<Utc> = localtime.with_timezone(&Utc);
     let utctime = Utc::now();
 
-    let _ = match client.execute(&stmt, &[&utctime, &(temp.clone()), &(rh.clone())]) {
+    let _ = match client.execute(&stmt, &[&utctime, &(temp.clone()), &(rh.clone())]).await {
         Ok(t) => t,
         Err(e) => {
             journal::print(3, &format!("Database execute error {:?}", e));
@@ -161,7 +181,7 @@ async fn climate_service(
 ///
 /// @brief runs the pump for a brief period of time and writes timestamp to log file 
 ///
-async fn pump_service(pump: &mut OutputPin) -> Result<(), Box<dyn std::error::Error>> {
+async fn pump_service(client: &mut Client, pump: &mut OutputPin) -> Result<(), Box<dyn std::error::Error>> {
 
     let start_time = Utc::now();
     let stmt = "INSERT INTO climate_data (timestamp, temperature, humidity, is_pump_start) VALUES ($1, NULL, NULL, TRUE);";
