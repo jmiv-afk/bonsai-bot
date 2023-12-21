@@ -1,13 +1,14 @@
 [package]
 name = "bonsai-bot"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-chrono = "0.4.23"
-timer = "0.2.*"
-rppal = "0.13.*"
-postgres = {version = "0.19.*", features = ["with-chrono-0_4"] }
+chrono = { version = "0.4", features = ["full"] }
+timer = "0.2"
+rppal = "0.13"
+tokio = { version = "1.35", features = ["full"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
 systemd = "0.10"
