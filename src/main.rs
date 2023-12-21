@@ -52,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             journal::print(3, &format!("Connection error: {}", e));
-            panic!("Panic! Could not connect to DB"));
+            panic!("Panic! Could not connect to DB");
         }
     })
 
