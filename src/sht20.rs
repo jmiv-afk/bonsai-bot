@@ -173,10 +173,10 @@ impl SHT20 {
 mod tests {
     use super::*;
 
-    #[test]
-    pub fn test_sht20() {
-        let mut s = SHT20::new().expect("Failed to create SHT20");
-        s.get_temperature_celsius().await.expect("Failed to get temperature");
+    #[tokio::test]
+    pub async fn test_sht20() {
+        let mut s = Arc::new(Mutex::new(SHT20::new().expect("Failed to create SHT20")));
+        SHT20::get_temperature_celsius(s).await.expect("Failed to get temperature");
     }
 }
 
