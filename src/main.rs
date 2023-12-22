@@ -25,7 +25,7 @@ const  HUMIDIFIER_PIN:        u8           = 24;
 const  CLIMATE_PERIODIC_MINS: i64          = 5;
 const  PUMP_PIN:              u8           = 27;
 const  PUMP_PERIODIC_HRS:     i64          = 24;
-const  PUMP_DURATION_SECS:    u64          = 30;
+const  PUMP_DURATION_SECS:    u64          = 60;
 
 ///
 /// @brief The main routine, for mains
@@ -188,8 +188,17 @@ async fn pump_service(client: &mut Client, pump: &mut OutputPin) -> Result<(), B
 
     client.execute(stmt, &[&start_time]).await?;
 
+    run_pump_interval(pump, PUMP_DURATION_SECS).await?;
+
+    Ok(())
+}
+
+///
+/// @brief Runs the pump for a specified duration in seconds by asserting the GPIO
+///
+async fn run_pump_interval(pump: &mut OutputPin, seconds: u64) -> Result<(), Box<dyn std::error::Error>> {
     pump.set_high();
-    sleep(TokioDuration::from_secs(PUMP_DURATION_SECS)).await;
+    sleep(TokioDuration::from_secs(seconds)).await;
     pump.set_low();
 
     Ok(())
@@ -222,3 +231,14 @@ async fn fan_service(fan: &mut OutputPin) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    pub async fn test_pump() {
+        let gpio = Gpio::new().expect("Cannot get access to GPIO");
+        let mut pump_gpio = gpio.get(PUMP_PIN).expect("GPIO cannot be taken").into_output(); 
+        run_pump_interval(&mut pump_gpio, 10).await.expect("Pump did not run"); 
+    }
+}
