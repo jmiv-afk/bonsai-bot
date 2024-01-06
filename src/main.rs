@@ -5,6 +5,8 @@ use chrono::{DateTime, Duration, Utc};
 use std::error::Error;
 use std::time::{Duration as StdDuration};
 use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
 use tokio::time::{interval_at, sleep, Instant, Duration as TokioDuration};
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls};
@@ -46,8 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut fan_gpio      = gpio.get(FAN_PIN)?.into_output();
 
     // connect to database
-    let database_url = std::env::var("BONSAIBOT_DATABASE_URL")?;
-    let (mut postgres_client, connection) = tokio_postgres::connect(&database_url, NoTls).await?;
+    let (mut postgres_client, connection) = establish_connection().await?;
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             journal::print(3, &format!("Connection error: {}", e));
@@ -56,28 +57,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // get updated timing for the next pump sequence
-    let pump_schedule_dt = match get_next_pump_schedule(&mut postgres_client).await {
+    let pump_schedule_dt: DateTime<Utc> = match get_next_pump_schedule(&mut postgres_client).await {
         Ok(t) => t,
         Err(e) => panic!("No pump scheduled: {}", e),
     };
 
-    // Assuming pump_schedule_dt is of type DateTime<Utc>
-    // Convert it to a std::time::Instant
-    let now = Instant::now();
-    let pump_schedule_instant = Instant::now() + StdDuration::from_secs(pump_schedule_dt.timestamp() as u64 - Utc::now().timestamp() as u64);
-
     // Calculate the duration until the pump schedule. If the time is in the past, default to a zero duration.
-    let duration_until_pump = if pump_schedule_instant > now {
-        pump_schedule_instant.duration_since(now)
+    let now_utc = Utc::now();
+    let duration_until_pump = if pump_schedule_dt > now_utc {
+        // pump_schedule_dt is in the future with respect to now
+        StdDuration::from_secs((pump_schedule_dt - now_utc).num_seconds().try_into().unwrap())
     } else {
+        // pump_schedule_dt is in the past with respect to now, we should schedule this immediately
         StdDuration::from_secs(0)
     };
 
     // setup service tick intervals
+    let now = Instant::now();
     let mut climate_interval = interval_at(now, TokioDuration::from_secs(60 * CLIMATE_PERIODIC_MINS as u64));
     let mut fan_interval = interval_at(now, TokioDuration::from_secs(60 * FAN_PERIODIC_MINS as u64));
     let mut pump_interval = interval_at(now + duration_until_pump,
                         TokioDuration::from_secs(60 * 60 * PUMP_PERIODIC_HRS as u64));
+
+    // Convert the pump schedule to Mountain Time (UTC-7) and format for logging
+    let mountain_time = pump_schedule_dt.with_timezone(&chrono::FixedOffset::west_opt(7 * 3600).unwrap());
+    journal::print(6, &format!("Next pump sequence scheduled at Localtime: {}", mountain_time.format("%Y-%m-%d %H:%M:%S %Z")));
 
     loop {
         tokio::select! {
@@ -86,6 +90,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(_) => {},
                     Err(e) => {
                         journal::print(3, &format!("Climate service error: {}", e));
+                        if let Some(db_error) = e.downcast_ref::<tokio_postgres::error::Error>() {
+                            if db_error.is_closed() {
+                                try_reconnect(&mut postgres_client).await?;
+                            } else {
+                                journal::print(3, &format!("Unhandled error: {}", db_error));
+                            }
+                        }
                         ()
                     },
                 }
@@ -111,6 +122,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 }
+
+///
+/// @brief Establishes client connection to the postgres DB
+///
+async fn establish_connection() -> Result<(Client, Pin<Box<dyn Future<Output = Result<(), tokio_postgres::Error>> + Send>>), Box<dyn std::error::Error>> {
+    let database_url = std::env::var("BONSAIBOT_DATABASE_URL")?;
+    let (client, connection) = tokio_postgres::connect(&database_url, NoTls).await?;
+    Ok((client, Box::pin(connection)))
+}
+
+/// 
+/// @brief Tries to reconnect to the postgres client
+///
+async fn try_reconnect(postgres_client: &mut tokio_postgres::Client) -> Result<(), Box<dyn std::error::Error>> {
+    if postgres_client.is_closed() {
+        let (new_client, new_connection) = establish_connection().await?;
+        *postgres_client = new_client;
+
+        tokio::spawn(async move {
+            if let Err(e) = new_connection.await {
+                journal::print(3, &format!("Reconnection error: {}", e));
+            }
+        });
+    }
+    Ok(())
+}
+
 
 ///
 /// @brief turns on humidifier if RH < RH_LO_THRESH and off if RH > RH_HI_THRESH
@@ -142,6 +180,8 @@ async fn climate_service(
         },
     };
 
+    rh = if rh > 100.0 { 100.0 } else { rh };
+
     // Insert data into the database
     let stmt = match client.prepare("INSERT INTO climate_data (timestamp, temperature, humidity, is_pump_start) VALUES ($1, $2, $3, FALSE)").await {
         Ok(t) => t,
@@ -151,8 +191,6 @@ async fn climate_service(
         }
     };
 
-//    let localtime = Local::now();
-//    let utctime: DateTime<Utc> = localtime.with_timezone(&Utc);
     let utctime = Utc::now();
 
     let _ = match client.execute(&stmt, &[&utctime, &(temp.clone()), &(rh.clone())]).await {
@@ -184,11 +222,28 @@ async fn climate_service(
 async fn pump_service(client: &mut Client, pump: &mut OutputPin) -> Result<(), Box<dyn std::error::Error>> {
 
     let start_time = Utc::now();
-    let stmt = "INSERT INTO climate_data (timestamp, temperature, humidity, is_pump_start) VALUES ($1, NULL, NULL, TRUE);";
+    let stmt = match client.prepare("INSERT INTO climate_data (timestamp, temperature, humidity, is_pump_start) VALUES ($1, NULL, NULL, TRUE);").await {
+        Ok(t) => t,
+        Err(e) => {
+            journal::print(3, &format!("Database prepare error {:?}", e));
+            return Err(Box::new(e));
+        }
+    };
 
-    client.execute(stmt, &[&start_time]).await?;
-
+    
+    journal::print(6, &format!("Starting pump sequence at {}", Utc::now().with_timezone(&chrono::FixedOffset::west_opt(7*3600).expect("FixedOffset::west_opt fail")).format("%Y-%m-%d %H:%M:%S %Z")));
+    
     run_pump_interval(pump, PUMP_DURATION_SECS).await?;
+
+    journal::print(6, &format!("Ending pump sequence at {}", Utc::now().with_timezone(&chrono::FixedOffset::west_opt(7*3600).expect("FixedOffset::west_opt fail")).format("%Y-%m-%d %H:%M:%S %Z")));
+
+    let _ = match client.execute(&stmt, &[&start_time]).await {
+        Ok(t) => t,
+        Err(e) => {
+            journal::print(3, &format!("Database execute error {:?}", e));
+            return Err(Box::new(e));
+        }
+    };
 
     Ok(())
 }
